@@ -22,12 +22,25 @@ namespace Building
         
         public int ElevatorCount { get => elevatorCount; private set => elevatorCount = value; }
 
-        private List<Elevator> elevators { get; set; }
+        private List<Elevator> elevators { get; set; } = new List<Elevator>();
 
-        public Building(int floors, int elevators)
+        public delegate void ElevatorAssignedDelegate(ElevatorRequest request);
+
+        public event ElevatorAssignedDelegate ElevaterAssigned;
+        public event ElevatorAssignedDelegate ElevaterReAssigned;
+        public event ElevatorAssignedDelegate ElevaterServed;
+
+        public Building(int numberOfFloors, int numberOfElevators)
         {
-            this.floors = floors;
-            this.elevatorCount = elevators;
+            this.floors = numberOfFloors;
+            this.elevatorCount = numberOfElevators;
+            for (int i = 0; i < this.elevatorCount; i++)
+            {
+                var elevator = new Elevator(i, 0, this.Floors);
+                elevator.RequestCompleted += Elevator_RequestCompleted;
+                elevator.NofityCurrentPosition += Elevator_NofityCurrentPosition;
+                elevators.Add(elevator);
+            }
         }
 
         public void AddAFloor()
@@ -40,14 +53,28 @@ namespace Building
             this.elevatorCount += 1;
             var elevator = new Elevator(this.elevatorCount, 0, this.Floors);
             elevator.RequestCompleted += Elevator_RequestCompleted;
+            elevator.NofityCurrentPosition += Elevator_NofityCurrentPosition;
             elevators.Add(elevator);
         }
 
-        private void Elevator_RequestCompleted(KeyValuePair<Guid, ElevatorRequest>[] request)
+        private void Elevator_NofityCurrentPosition(int liftId, bool direction, int currentFloor)
         {
-            Array.ForEach(request, item => {
-                rootRequests.TryRemove(item.Key, out ElevatorRequest data);
-            });
+            var elevator = elevators.Where(item => item.Id == liftId).FirstOrDefault();
+            var requestMatches = rootRequests.Where(item => !item.Value.ElevatorId.Equals(liftId) && item.Value.Direction.Equals(direction) && item.Value.Floor.Equals(currentFloor + 1)).ToList();
+            foreach (var match in requestMatches)
+            {
+                var elevatorCurrent = elevators.Where(item => item.Id == liftId).FirstOrDefault();
+                elevatorCurrent?.CancelRequest(match.Key);
+                match.Value.ElevatorId = liftId;
+                elevator?.SignalFromOutside(match.Key, match.Value);
+                ElevaterReAssigned?.Invoke(match.Value);
+            }
+        }
+
+        private void Elevator_RequestCompleted(KeyValuePair<Guid, ElevatorRequest> request)
+        {
+            rootRequests.TryRemove(request.Key, out ElevatorRequest data);
+            ElevaterServed?.Invoke(request.Value);
         }
 
         /// <summary>
@@ -69,13 +96,40 @@ namespace Building
             AssignElevator(request);
         }
 
+        public void SignalElevatorFromInside(int elevatorId, int requestedFloor)
+        {
+            var elevetor = elevators.Where(item => item.Id == elevatorId).FirstOrDefault();
+            elevetor?.SignalFromInside(Guid.NewGuid(), new ElevatorRequest()
+            {
+                Direction = elevetor.Direction, // This just for assignment purpose
+                ElevatorId = elevatorId,
+                Floor = requestedFloor
+            });
+        }
+
         private void AssignElevator(ElevatorRequest request)
         {
-            //int offset = 0;
-            //int elevatorId = 0;
-            
-            
+            int offset = int.MaxValue;
+            int elevatorId = 0;
+            Elevator elevator = null;
+            foreach (var item in elevators)
+            {
+                int currentOffset = item.CalculateOffset(request.Floor, request.Direction);
+                if(currentOffset < offset)
+                {
+                    elevator = item;
+                    request.ElevatorId = elevatorId = item.Id;
+                    offset = currentOffset;
+                }
+            }
 
+            if(elevator!= null && elevator.Status == ElevatorState.Stopped)
+            {
+                elevator.Direction = request.Direction;
+            }
+
+            elevator?.SignalFromOutside(Guid.NewGuid(), request);
+            ElevaterAssigned?.Invoke(request);
         }
     }
 }

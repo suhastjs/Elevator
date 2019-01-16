@@ -13,6 +13,7 @@ namespace Building
         public bool Direction { get; set; } = true;
 
         public int Floor { get; set; } = 0;
+        public bool FromInside { get; set; } = false;
     }
 
     public enum DoorState
@@ -23,7 +24,7 @@ namespace Building
         Closing
     }
 
-    public enum ElevaterState
+    public enum ElevatorState
     {
         Stopped,
         Working
@@ -77,7 +78,7 @@ namespace Building
         /// <summary>
         /// Gets or sets Elevator door status. True => Closed, False => Open.
         /// </summary>
-        public ElevaterState Status { get; set; } = ElevaterState.Stopped;
+        public ElevatorState Status { get; set; } = ElevatorState.Stopped;
 
         // Elevator takes 2 seconds to move to next/previous floor
         private Timer moveToFloorDelay = new Timer()
@@ -109,9 +110,21 @@ namespace Building
 
         private bool interruptDoorClose = false;
 
-        public delegate void RequestCompletedDelegate(KeyValuePair<Guid, ElevatorRequest>[] request);
+        public delegate void RequestCompletedDelegate(KeyValuePair<Guid, ElevatorRequest> request);
 
-        public event RequestCompletedDelegate RequestCompleted;        
+        /// <summary>
+        /// Elevator Event to notify that the request is served for outside requests. 
+        /// </summary>
+        public event RequestCompletedDelegate RequestCompleted;
+
+        public delegate void NotifyCurrentPosition(int liftId, bool direction, int nextFloor);
+
+        /// <summary>
+        /// Elevator Event to notify the builder regarding current position
+        /// </summary>
+        public event NotifyCurrentPosition NofityCurrentPosition;
+
+        private ConcurrentDictionary<Guid, ElevatorRequest> requests = new ConcurrentDictionary<Guid, ElevatorRequest>();
 
         /// <summary>
         /// Initializes an object of the class <see cref="Elevator"/>
@@ -129,9 +142,12 @@ namespace Building
             doorOpenDelay.Elapsed += DoorOpenDelay_Elapsed;
             doorCloseingDelay.Elapsed += DoorCloseingDelay_Elapsed;
         }
-        
-        private ConcurrentDictionary<Guid, ElevatorRequest> requests = new ConcurrentDictionary<Guid, ElevatorRequest>();
 
+        /// <summary>
+        /// Method to signal the elevator that a request has been assigned to it.
+        /// </summary>
+        /// <param name="id">Request id</param>
+        /// <param name="request">Request parameter</param>
         public void SignalFromOutside(Guid id, ElevatorRequest request)
         {
             // Signal door to open if the lift is in same floor and is closing or closed
@@ -144,28 +160,70 @@ namespace Building
 
             request.ElevatorId = this.Id;
             this.requests.TryAdd(id, request);
+
+            if (this.Status == ElevatorState.Stopped)
+            {
+                Console.WriteLine($"Elevator {Id} Strated because of outside request");
+                PerformLiftJob(request.Direction);
+            }
         }
 
+        /// <summary>
+        /// Signal elevator to move to certain floor of user choice. 
+        /// </summary>
+        /// <param name="id">Request Id</param>
+        /// <param name="request">Request Parameters</param>
         public void SignalFromInside(Guid id, ElevatorRequest request)
         {
+            request.FromInside = true;
             if (this.CurrentFloor != request.Floor)
             {
                 request.ElevatorId = this.Id;
                 this.requests.TryAdd(id, request);
             }
 
-            if (this.Status == ElevaterState.Stopped)
+            if (this.Status == ElevatorState.Stopped)
             {
-                PerformLiftJob(request.Direction);
+                Console.WriteLine($"Elevator {Id} Strated from inside request");
+                if (request.Floor == this.CurrentFloor)
+                {
+                    DoorOpeningDelay_Elapsed(null, null);
+                }
+                else
+                {
+                    request.Direction = this.Direction = request.Floor > this.CurrentFloor;
+                    PerformLiftJob(this.Direction);
+                }
             }
         }
 
+        /// <summary>
+        /// Interrupt door event which will open the lift door if cloosing 
+        /// </summary>
         public void InterruptDoorClosing()
         {
             if(this.DoorStatus == DoorState.Closing)
             {
                 interruptDoorClose = true;
             }
+        }
+
+        /// <summary>
+        /// Calculate the request offset so that building can make necessary decision on assigning the request.
+        /// </summary>
+        /// <param name="requestedFloor"></param>
+        /// <returns></returns>
+        public int CalculateOffset(int requestedFloor, bool direction)
+        {
+            var offset = default(int);
+            offset = (this.CurrentFloor < requestedFloor) ? requestedFloor - this.CurrentFloor : this.CurrentFloor - requestedFloor;
+
+            if (this.Status == ElevatorState.Working && this.Direction != direction)
+            {
+                offset += this.FloorUpperLimit;
+            }
+            
+            return offset;
         }
 
         public void CancelRequest(Guid requestId)
@@ -175,7 +233,7 @@ namespace Building
 
         private void PerformLiftJob(bool direction)
         {
-            this.Status = ElevaterState.Working;
+            this.Status = ElevatorState.Working;
 
             this.Direction = direction;
             if ((this.Direction && CurrentFloor == floorUpperLimit) || (!this.Direction && CurrentFloor == FloorLowerLimit))
@@ -184,8 +242,7 @@ namespace Building
                 this.Direction = !this.Direction;
             }
 
-            // Assuming that Door status will be closed when first request arive ot when Lift is idle.
-            this.DoorStatus = DoorState.Closed;
+            this.DoorStatus = DoorState.Closing;
             DoorCloseingDelay_Elapsed(null, null);
         }
 
@@ -199,6 +256,7 @@ namespace Building
                     this.DoorStatus = DoorState.Opening;
                     interruptDoorClose = false;
                 }
+
                 doorOpeningDelay.Start();
             }
             else
@@ -209,7 +267,7 @@ namespace Building
         }
 
         private void MoveToFloorDelay_Elapsed(object sender, ElapsedEventArgs e)
-        {
+        {            
             // Reverse the direction if the elevator is on lower or upper limit.
             if ((this.Direction && CurrentFloor == floorUpperLimit) || (!this.Direction && CurrentFloor == FloorLowerLimit))
             {
@@ -227,26 +285,57 @@ namespace Building
                 this.CurrentFloor--;
             }
 
-            this.DoorStatus = DoorState.Opening;
-            doorOpeningDelay.Start();
+            NofityCurrentPosition?.Invoke(this.Id, this.Direction, this.CurrentFloor);
+
+            // Check if there is any request to be served for current floor. If not, Move to next floor without door opening. 
+            if (this.requests.Where(item => item.Value.Direction == this.Direction && item.Value.Floor == this.CurrentFloor).Count() != 0)
+            {
+                this.DoorStatus = DoorState.Opening;
+                doorOpeningDelay.Start();
+            }
+            else if(this.requests.Where(item => item.Value.FromInside == true).Count() ==0 && this.requests.Where(item => item.Value.Floor == this.CurrentFloor).Count() != 0)
+            {
+                // there are no more inside requests from inside. So outside request has to be prioritized.
+                this.DoorStatus = DoorState.Opening;
+                doorOpeningDelay.Start();
+            }
+            else
+            {
+                moveToFloorDelay.Start();
+            }
         }
 
         private void DoorOpeningDelay_Elapsed(object sender, ElapsedEventArgs e)
         {
             this.DoorStatus = DoorState.Open;
+
+            var requestsServed = this.requests.Where(item => item.Value.Floor == CurrentFloor).ToArray();
             var continueLiftOperation = EmptyRequests();
             if(!continueLiftOperation)
             {
-                Status = ElevaterState.Stopped;
+                Status = ElevatorState.Stopped;
+                moveToFloorDelay.Stop();
+                doorOpeningDelay.Stop();
+                doorOpenDelay.Stop();
+                doorCloseingDelay.Stop();
+                Console.WriteLine($"Elevator {Id} Stopped");
+            }
+            else
+            {
+                doorOpenDelay.Start();
             }
 
-            doorOpenDelay.Start();
+
+            foreach (var item in requestsServed)
+            {
+                RequestCompleted?.Invoke(item);
+            }
         }
 
         private void DoorOpenDelay_Elapsed(object sender, ElapsedEventArgs e)
         {
             this.DoorStatus = DoorState.Closing;
-            if (this.Status == ElevaterState.Working)
+            if (this.Status == ElevatorState.Working)
             {
                 doorCloseingDelay.Start();
             }
@@ -262,11 +351,9 @@ namespace Building
                 this.requests.TryRemove(item.Key, out ElevatorRequest request);
             }
 
-            this.requests = (ConcurrentDictionary<Guid, ElevatorRequest>)this.requests.Where(item => item.Value.Floor != CurrentFloor);
+            var count = this.requests.Where(item => item.Value.Floor != CurrentFloor).Count();
 
-            RequestCompleted?.Invoke(requestServed);
-
-            if (this.requests.Count != 0)
+            if (count != 0)
             {
                 continueLiftOperation = true;
             }
